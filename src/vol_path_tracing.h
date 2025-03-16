@@ -585,6 +585,137 @@ Spectrum vol_path_tracing_5(const Scene &scene,
     return radiance;
 }
 
+Spectrum next_event_estimation_heter(
+    const Ray& ray_in, int meidum_id, const Scene& scene,  int shadow_bounces, 
+    pcg32_state &rng, std::optional<PathVertex> vertex = std::nullopt
+) {
+
+    Vector3 p = ray_in.org;
+    Vector3 view_dir = -ray_in.dir;
+
+    Vector2 light_uv{next_pcg32_real<Real>(rng), next_pcg32_real<Real>(rng)};
+    Real shape_w = next_pcg32_real<Real>(rng);
+    Real light_w = next_pcg32_real<Real>(rng);
+    Real light_id = sample_light(scene, light_w);
+    const Light &light = scene.lights[light_id];
+
+    PointAndNormal p_prime = sample_point_on_light(light, p, light_uv, shape_w, scene);
+
+    Spectrum transmittance_light = make_const_spectrum(1.0);
+    int shadow_medium_id = meidum_id;
+    // for mis
+    Spectrum p_trans_dir = make_const_spectrum(1.0); 
+    Spectrum p_trans_nee = make_const_spectrum(1.0);
+
+    Vector3 p_i = p;
+
+    Vector3 shadow_dir = normalize(p_prime.position - p);
+
+    while (true) {
+        Ray shadow_ray{p, shadow_dir,
+                       get_shadow_epsilon(scene),
+                       (1 - get_shadow_epsilon(scene)) *
+                           distance(p_prime.position, p)};
+        auto isect = intersect(scene, shadow_ray);
+        Real next_t = distance(p, p_prime.position);
+        if(isect) {
+            next_t = distance(p, isect->position);
+        }
+
+        if(shadow_medium_id >= 0) {
+            const Medium &medium = scene.media[shadow_medium_id];
+            Spectrum majorant = get_majorant(medium, shadow_ray);
+
+            // sample channel
+            Real u = next_pcg32_real<Real>(rng);
+            int channel = std::clamp( int(u*3), 0, 2 );
+            Real accum_t = 0;
+            int iteration = 0;
+
+
+            while (true) {
+        
+                // violation or exceed maxium
+                if (iteration >= scene.options.max_null_collisions || 
+                        majorant[channel] <= 0 ) 
+                    break;
+                
+                Real t = -log(1 - next_pcg32_real<Real>(rng)) / majorant[channel];
+                Real dt = next_t - accum_t;
+                accum_t = min(accum_t + t, next_t);
+                if (t < dt) {
+                    // scatter
+                    p = p + t * shadow_dir;
+                    Spectrum sigma_t = get_sigma_a(medium, p) + get_sigma_s(medium, p);
+                    Spectrum real_prob = sigma_t / majorant;
+
+                    transmittance_light *= exp(-majorant * t) * (majorant - sigma_t) / max(majorant);
+                    p_trans_nee *= exp(-majorant * t) * majorant / max(majorant);
+                    p_trans_dir *= exp(-majorant * t) * majorant * (1 - real_prob) / max(majorant);
+                    if (max(transmittance_light) <= 0) {
+                        break;
+                    }
+                } else {
+                    // hit surface
+                    p = p + dt * shadow_dir;
+                    transmittance_light *= exp(-majorant * dt);
+                    p_trans_nee *= exp(-majorant * dt);
+                    p_trans_dir *= exp(-majorant * dt);
+
+                    // for fast rendering
+                    break;
+                }
+                iteration++;
+            }
+        }        
+        if(!isect) {
+            break;
+        } 
+        // blocked by a surface
+        if(isect->material_id >= 0) {
+            return make_zero_spectrum();
+        }
+
+        shadow_bounces++;
+        if(scene.options.max_depth != -1 && shadow_bounces >= scene.options.max_depth) {
+            return make_zero_spectrum();
+        }
+        shadow_medium_id = update_medium(*isect, shadow_ray, shadow_medium_id);
+        p = isect->position;     
+    }
+    
+    if (max(transmittance_light) > 0) {
+        Real dist_sqr = distance_squared(p_i, p_prime.position);
+        
+        Real cos_theta = abs(dot(-shadow_dir, p_prime.normal));
+        Real G= cos_theta/ dist_sqr;
+
+        Real pdf_nee = light_pmf(scene, light_id) * pdf_point_on_light(light, p_prime, p_i, scene) * avg(p_trans_nee);
+
+        Spectrum L = emission(light, -shadow_dir, 0, p_prime, scene);
+
+        Spectrum f = make_zero_spectrum();
+        Real pdf_sample = 1.0;
+
+        if(vertex) {
+            const Material& mat = scene.materials[vertex->material_id];
+            f  = eval(mat, view_dir, shadow_dir, vertex.value(), scene.texture_pool);
+            pdf_sample = pdf_sample_bsdf(mat, view_dir, shadow_dir, *vertex, scene.texture_pool) * G * avg(p_trans_dir); 
+        } else {
+            PhaseFunction phase_function = get_phase_function(scene.media[meidum_id]);
+            f = eval(phase_function, view_dir, shadow_dir);
+            pdf_sample = pdf_sample_phase(phase_function, view_dir, shadow_dir) * G * avg(p_trans_dir);
+        }
+
+        Real weight = (pdf_nee * pdf_nee) / (pdf_nee * pdf_nee + pdf_sample * pdf_sample);
+        Spectrum   contrib = transmittance_light * G * f * L / pdf_nee;
+        return weight * contrib;
+
+    }
+
+    return make_zero_spectrum();
+}
+
 
 
 // The final volumetric renderer: 
@@ -595,7 +726,197 @@ Spectrum vol_path_tracing(const Scene &scene,
                           int x, int y, /* pixel coordinates */
                           pcg32_state &rng) {
     // Homework 2: implememt this!
-    return make_zero_spectrum();
+    int w = scene.camera.width, h = scene.camera.height;
+    Vector2 screen_pos((x + next_pcg32_real<Real>(rng)) / w,
+                    (y + next_pcg32_real<Real>(rng)) / h);
+
+    Ray ray = sample_primary(scene.camera, screen_pos);
+    ray.tnear = get_intersection_epsilon(scene);
+
+    int medium_id = scene.camera.medium_id;
+
+    Spectrum current_throughput = make_const_spectrum(1.0);
+    Spectrum radiance = make_zero_spectrum();
+    int bounces = 0;
+
+    Real dir_pdf = 0;
+    Spectrum mis_trans_pdf = make_const_spectrum(1.0); 
+    Spectrum mis_nee_pdf = make_const_spectrum(1.0);
+    Vector3 nee_cache;
+    bool never_scatter = true;
+
+    while (true) {
+
+        bool scatter = false;
+        std::optional<PathVertex> vertex_ = intersect(scene, ray); 
+    
+        Spectrum transmittance = make_const_spectrum(1.0);
+        Spectrum trans_dir_pdf = make_const_spectrum(1.0);
+        Spectrum trans_nee_pdf = make_const_spectrum(1.0);
+    
+        Real t_hit = infinity<Real>();
+        
+        if(vertex_) {
+            t_hit = distance(ray.org, vertex_->position);
+        }
+
+        if(medium_id >= 0) {
+            const Medium& medium = scene.media[medium_id];
+            Spectrum majorant = get_majorant(medium, ray);
+            Real u = next_pcg32_real<Real>(rng);
+            int channel = std::clamp(int(u * 3), 0, 2);
+            Real accum_t = 0;
+            int iteration = 0;
+            while(true) {
+        
+                if(majorant[channel] <= 0) {
+                    break;
+                }
+                if(iteration >= scene.options.max_null_collisions) {
+                    break;
+                }
+                
+                Real t = -log(1 - next_pcg32_real<Real>(rng)) / majorant[channel];
+                Real dt = t_hit - accum_t;
+                accum_t = min(t_hit, accum_t + t);
+                if (t < dt) {
+                    // haven't reached the/a surface, sample from real/fake particle events
+                    ray.org = ray.org + t * ray.dir;
+                    Spectrum sigma_t = get_sigma_a(medium, ray.org) + get_sigma_s(medium, ray.org);
+                    Spectrum real_prob = sigma_t / majorant;
+                    if (next_pcg32_real<Real>(rng) < real_prob[channel]) {
+                        // real, scatter
+                        scatter = true;
+                        never_scatter = false;
+                        transmittance *= exp(-majorant * t) / max(majorant);
+                        trans_dir_pdf *= exp(-majorant * t) * majorant * real_prob / max(majorant);
+                        
+                        break;
+                    } else {
+                        // fake
+                        transmittance *= exp(-majorant * t) * (majorant - sigma_t) / max(majorant);
+                        trans_dir_pdf *= exp(-majorant * t) * majorant * (1 - real_prob) / max(majorant);
+                        trans_nee_pdf *= exp(-majorant * t) * majorant / max(majorant);
+                    }
+                } else {
+                    // hit a surface
+                    ray.org += dt * ray.dir;
+                    transmittance *= exp(-majorant * dt);
+                    trans_dir_pdf *= exp(-majorant * dt);
+                    trans_nee_pdf *= exp(-majorant * dt);
+                    break;
+                }
+                iteration++;
+            }
+            mis_trans_pdf *= trans_dir_pdf;
+            mis_nee_pdf *= trans_nee_pdf;        
+        } 
+        current_throughput *= (transmittance / avg(trans_dir_pdf));
+
+        if(!scatter && vertex_ && is_light(scene.shapes[vertex_->shape_id])) {
+            if(never_scatter)
+                radiance += current_throughput * emission(*vertex_, -ray.dir, scene);
+            else {
+                int light_id = get_area_light_id(scene.shapes[vertex_->shape_id]);
+                PointAndNormal light_point = {vertex_->position, vertex_->geometric_normal};
+                Real pdf_nee = light_pmf(scene, light_id) * pdf_point_on_light(scene.lights[light_id], light_point, nee_cache, scene) * avg(mis_nee_pdf);
+
+                Vector3 ray_prime = normalize(vertex_->position - nee_cache);
+                Real G = abs(dot(ray_prime, light_point.normal)) / distance_squared(vertex_->position, nee_cache);
+                Real dir_pdf_ = dir_pdf * avg(mis_trans_pdf) * G;
+                Real weight = (dir_pdf_ * dir_pdf_) / (pdf_nee * pdf_nee + dir_pdf_ * dir_pdf_);
+                radiance += current_throughput * emission(*vertex_, -ray.dir, scene) * weight;
+            }
+        }
+    
+        if(bounces == scene.options.max_depth - 1) {
+            break;
+        }
+
+        if(!scatter && vertex_) {
+            ray.org = vertex_->position;
+            if(vertex_->material_id == -1) {
+                medium_id = update_medium(*vertex_, ray, medium_id);
+                bounces++;
+                continue;
+            }
+        }
+
+        if(scatter) {
+            never_scatter = false;
+            auto medium = scene.media[medium_id];
+            auto phase_function = get_phase_function(medium);
+            Vector2 randomUV = {next_pcg32_real<Real>(rng), next_pcg32_real<Real>(rng)};
+            std::optional<Vector3> next_dir = sample_phase_function(
+                phase_function, -ray.dir, randomUV
+            );
+            if(next_dir) {
+                Spectrum sigma_s = get_sigma_s(medium, vertex_->position);
+                Spectrum nee =   next_event_estimation_heter(ray, medium_id, scene, bounces, rng);
+                radiance += current_throughput * nee * sigma_s;
+                Real phase_pdf = pdf_sample_phase(phase_function, -ray.dir, *next_dir);
+                current_throughput *= (eval(phase_function, -ray.dir, *next_dir) / phase_pdf) * sigma_s;
+                mis_nee_pdf = make_const_spectrum(1);
+                nee_cache = ray.org;
+                ray.dir = *next_dir;
+                dir_pdf = phase_pdf;
+                mis_trans_pdf = make_const_spectrum(1.0);
+                mis_trans_pdf = make_const_spectrum(1.0);
+            } 
+        } else if(vertex_ && vertex_->material_id != -1) {
+            // hit a surface
+            never_scatter = false;
+            Spectrum nee = next_event_estimation_heter(ray, medium_id, scene, bounces, rng, vertex_);
+            radiance += current_throughput * nee;
+            const Material &mat = scene.materials[vertex_->material_id];
+            Vector3 dir_view = -ray.dir;
+            Vector2 bsdf_rnd_param_uv{next_pcg32_real<Real>(rng), next_pcg32_real<Real>(rng)};
+            Real bsdf_rnd_param_w = next_pcg32_real<Real>(rng);
+            std::optional<BSDFSampleRecord> bsdf_sample_ =
+                sample_bsdf(mat,
+                    dir_view,
+                    *vertex_,
+                    scene.texture_pool,
+                    bsdf_rnd_param_uv,
+                    bsdf_rnd_param_w);
+        
+            if (!bsdf_sample_) {
+                // BSDF sampling failed. Abort the loop.
+                break;
+            }
+    
+            const BSDFSampleRecord &bsdf_sample = *bsdf_sample_;
+    
+            if(bsdf_sample.eta != 0) {
+                // update medium if it's a transmission event
+                medium_id = update_medium(*vertex_, ray, medium_id);
+            }
+    
+            Vector3 dir_bsdf = bsdf_sample.dir_out;
+            ray.dir = dir_bsdf;
+           
+    
+            Spectrum f = eval(mat, dir_view, dir_bsdf, *vertex_, scene.texture_pool);
+            Real bsdf_pdf = pdf_sample_bsdf(mat, dir_view, dir_bsdf, *vertex_, scene.texture_pool);
+            current_throughput *= f / bsdf_pdf;
+    
+            dir_pdf = bsdf_pdf;
+            mis_trans_pdf = make_const_spectrum(1.0);
+            nee_cache = ray.org;
+            
+        }
+    
+        // Russian
+        if(bounces >= scene.options.rr_depth) {
+            Real rr_prob = min(luminance(current_throughput), 0.95);
+            if(next_pcg32_real<Real>(rng) > rr_prob) {
+                break;
+            } else {
+                current_throughput /= rr_prob;
+            }
+        }
+        bounces++;
+    }
+    
+    return radiance;
 }
-
-
