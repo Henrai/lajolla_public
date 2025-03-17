@@ -1,0 +1,100 @@
+import os
+
+# Base XML template
+xml_template = """<?xml version="1.0" encoding="utf-8"?>
+
+<scene version="0.5.0">
+	<integrator type="volpath">
+		<integer name="maxDepth" value="-1"/>
+		<integer name="version" value="6"/>
+	</integrator>
+
+	<medium type="heterogeneous" id="smoke">
+		<string name="method" value="woodcock"/>
+
+		<volume name="density" type="gridvolume">
+			<string name="filename" value="../vols/density-{vol_number}.vol"/>
+		</volume>
+
+		<volume name="albedo" type="constvolume">
+			<rgb name="value" value="0.9"/>
+		</volume>
+		<float name="scale" value="100"/>
+
+		<float name="stepSize" value="0.1"/>
+
+		<phase type="hg">
+			<float name="g" value="0.0"/>
+		</phase>
+	</medium>
+	<bsdf type="roughdielectric" id="teapot">
+		<float name="intIOR" value="1.2"/>
+		<float name="alpha" value="0.01"/>
+		<rgb name="specularReflectance" value="0.8"/>
+		<rgb name="specularTransmittance" value="1"/>
+	</bsdf>
+	
+	<shape type="obj">
+		<string name="filename" value="bounds.obj"/>
+		<ref id="teapot"/>
+		<ref name="interior" id="smoke"/>
+	</shape>
+
+	<shape type="obj">
+		<string name="filename" value="plane.obj"/>
+
+		<bsdf type="diffuse">
+			<rgb name="reflectance" value=".2, .2, .3"/>
+		</bsdf>
+		<transform name="toWorld">
+			<translate y=".48"/>
+		</transform>
+	</shape>
+
+	<sensor type="perspective">
+		<float name="focusDistance" value="1.25668"/>
+		<float name="fov" value="45.8402"/>
+		<string name="fovAxis" value="x"/>
+		<transform name="toWorld">
+			<scale x="-1"/>
+
+			<lookat target="-0.166029, 0.08, -0.537402" origin="-0.5, 0.2, -2" up="-0.000640925, -0.999985, -0.0055102"/>
+		</transform>
+
+		<sampler type="independent">
+			<integer name="sampleCount" value="100"/>
+		</sampler>
+
+		<film type="hdrfilm">
+			<integer name="height" value="576"/>
+			<integer name="width" value="768"/>
+
+			<rfilter type="gaussian"/>
+		</film>
+	</sensor>
+
+	<shape type="sphere">
+		<point name="center" x="0" y="-2" z="-1"/>
+		<float name="radius" value="1"/>
+
+		<emitter type="area">
+			<spectrum name="radiance" value="16"/>
+		</emitter>
+	</shape>
+</scene>
+"""
+
+# Directory to save XML files
+output_dir = "./"
+os.makedirs(output_dir, exist_ok=True)
+
+# Generate XML files for vol numbers 0000 to 1000
+for i in range(1001):
+    vol_number = f"{i:04d}"  # Format as 4-digit number
+    xml_content = xml_template.format(vol_number=vol_number)
+
+    file_path = os.path.join(output_dir, f"scene_{vol_number}.xml")
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(xml_content)
+
+print(f"Generated {1001} XML files in '{output_dir}'")
